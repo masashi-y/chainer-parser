@@ -20,14 +20,18 @@ class Vocab(object):
     pad = "PADDING"
     unk = "UNKNOWN"
 
-    def __init__(self, word_path, tag_path=None, pretrained_path=None):
-        self.freq   = None
+    def __init__(self, word_path, tag_path=None, cutoff=1, pretrained_path=None):
         self.words  = Vocab._read_listfile(word_path)
-        self.tags   = Vocab._read_listfile(tag_path)
-        # self.tags   = defaultdict(lambda: len(self.tags))
         self.labels = defaultdict(lambda: len(self.tags))
-        # self.tags[Vocab.unk]   = 0
         self.labels[Vocab.unk] = 0
+        self.freq   = None
+        self.cutoff = cutoff
+
+        if tag_path is not None:
+            self.tags   = Vocab._read_listfile(tag_path)
+        else:
+            self.tags   = defaultdict(lambda: len(self.tags))
+            self.tags[Vocab.unk] = 0
 
         if pretrained_path is not None:
             self.pretrained = Vocab._read_pretrained(pretrained_path)
@@ -73,9 +77,10 @@ class Vocab(object):
 
     def create_token(self, wstr, tstr, head, lstr):
         norm_wstr = Vocab.normalize(wstr)
-        word = self.words[norm_wstr] if self.freq[norm_wstr] > 0 else self.words[Vocab.unk]
-        tag  = self.tags[tstr]
-        label = self.labels[lstr]
+        map_unk   = self.freq[norm_wstr] < self.cutoff
+        word      = self.words[Vocab.unk] if map_unk else self.words[norm_wstr]
+        tag       = self.tags[tstr]
+        label     = self.labels[lstr]
         return Token(word, tag, head, label, wstr, tstr, lstr)
 
     def roottoken(self):
@@ -166,22 +171,30 @@ class Vocab(object):
     def _get_id(d):
         return lambda: len(d)
 
+    def setup_save(self):
+        self.words.default_factory  = None
+        self.tags.default_factory   = None
+        self.labels.default_factory = None
+        if self.freq is not None:
+            self.freq.default_factory = None
+
+    def _load(self):
+        self.words.default_factory  = Vocab._get_id(self.words)
+        self.tags.default_factory   = Vocab._get_id(self.tags)
+        self.labels.default_factory = Vocab._get_id(self.labels)
+        if self.freq is not None:
+            self.freq.default_factory = Vocab._get_id(self.freq)
+
     def save(self, path):
         with open(path, "wb") as f:
-            self.words.default_factory  = None
-            self.tags.default_factory   = None
-            self.labels.default_factory = None
-            self.freq.default_factory   = None
+            self.setup_save()
             pickle.dump(self, f)
 
     @staticmethod
     def load(path):
         with open(path) as f:
             res = pickle.load(f)
-            res.words.default_factory  = Vocab._get_id(res.words)
-            res.tags.default_factory   = Vocab._get_id(res.tags)
-            res.labels.default_factory = Vocab._get_id(res.labels)
-            res.freq.default_factory   = Vocab._get_id(res.freq)
+            res._load()
             return res
 
 class Token(object):
@@ -544,7 +557,8 @@ class Example(object):
 
 class FeedForward(Chain):
     def __init__(self, vocab, embedsize=50, hiddensize=1024, use_topk_tags=True,
-            token_context_size=20, label_context_size=12, rescale_embed=True):
+            token_context_size=20, label_context_size=12, rescale_embed=True,
+            wscale=1., averaging=True):
         self.wordsize    = len(vocab.words)
         self.tagsize     = len(vocab.tags)
         self.labelsize   = len(vocab.labels)
@@ -558,9 +572,13 @@ class FeedForward(Chain):
                 t_embed = L.Linear(self.tagsize, embedsize),
                 # t_embed = L.EmbedID(self.tagsize, embedsize),
                 l_embed = L.EmbedID(self.labelsize, embedsize),
-                linear1 = L.Linear(self.contextsize, hiddensize),
-                linear2 = L.Linear(hiddensize, self.targetsize)
+                linear1 = L.Linear(self.contextsize, hiddensize, wscale=wscale),
+                linear2 = L.Linear(hiddensize, self.targetsize, wscale=wscale)
                 )
+
+        # to ensure most ReLU units to activate in the first epochs
+        self.linear1.b.data[:] = .2
+        self.linear2.b.data[:] = .2
 
         if vocab.pretrained is not None:
             self.w_embed.W = Variable(vocab.pretrained)
@@ -570,8 +588,16 @@ class FeedForward(Chain):
             rescale(self.t_embed.W.data, .0, 1.)
             rescale(self.l_embed.W.data, .0, 1.)
 
+        print >> sys.stderr, "(mean={:0.4f}, std={:0.4f})".format(
+            np.mean(self.linear1.W.data), np.std(self.linear1.W.data))
+        print >> sys.stderr, "(mean={:0.4f}, std={:0.4f})".format(
+            np.mean(self.linear2.W.data), np.std(self.linear2.W.data))
+
+        self.averaged = None
         self.train = True
         self.drop_rate = .5
+
+        print >> sys.stderr, "hiddensize =", hiddensize
 
     def set_train(self, train):
         self.train = train
@@ -604,9 +630,10 @@ class FeedForward(Chain):
         h_l = self.l_embed(label_ids)
 
         # batch x [w; t; l] x embedsize
-        h = F.concat([h_w, h_t, h_l], 1)
+        h  = F.concat([h_w, h_t, h_l], 1)
         h1 = F.relu(self.linear1(h))
-        h2 = F.dropout(h1, ratio=self.drop_rate, train=self.train)
+        # h2 = F.dropout(h1, ratio=self.drop_rate, train=self.train)
+        h2 = h1
         h3 = self.linear2(h2)
         return h3 * valids
 
@@ -624,6 +651,37 @@ class FeedForward(Chain):
         with open(path) as f:
             return pickle.load(f)
 
+class WeightAveraged(FeedForward):
+    def __init__(self, vocab, decay=0.99, **args):
+        super(WeightAveraged, self).__init__(vocab, rescale_embed=False, **args)
+        self.decay = decay
+        self.step = 1
+
+    def setup(self, model):
+        self.params = model.__dict__["_children"]
+        for param in self.params:
+            p = getattr(self, param)
+            q = getattr(model, param)
+
+            if type(p) == L.EmbedID:
+                p.W.data = q.W.data.copy()
+            elif type(p) == L.Linear:
+                p.W.data = q.W.data.copy()
+                p.b.data = q.b.data.copy()
+
+        model.averaged = self
+        self.parent = model
+
+    def update(self):
+        for param in self.params:
+            alpha = min(self.decay, (1. + self.step) / (10. + self.step))
+            p = getattr(self, param)
+            q = getattr(self.parent, param)
+            p.W.data = alpha * p.W.data + (1 - alpha) * q.W.data
+            if type(p) == L.Linear:
+                p.b.data = alpha * p.b.data + (1 - alpha) * q.b.data
+        self.step += 1
+
 def rescale(embed, rmean, rstd):
     print >> sys.stderr, "scaling embedding"
     mean = np.mean(embed)
@@ -640,16 +698,18 @@ def rescale(embed, rmean, rstd):
 
 class Parser(object):
     def __init__(self, vocab, batchsize=10000, niters=20000,
-            evaliter=200, gpu=False, **args):
-        self.batchsize = batchsize
-        self.niters    = niters
-        self.evaliter  = evaliter
-        self.model = FeedForward(vocab)
-        self.targetsize = vocab.targetsize()
-        self.gpu = gpu
+            do_averaging=True, evaliter=200, gpu=False, **args):
+        self.vocab        = vocab
+        self.batchsize    = batchsize
+        self.niters       = niters
+        self.evaliter     = evaliter
+        self.model        = FeedForward(vocab, **args)
+        self.targetsize   = vocab.targetsize()
+        self.do_averaging = do_averaging
+        self.gpu          = gpu
         print >> sys.stderr, "gpu =", gpu
 
-    def __call__(self, sents):
+    def __call__(self, sents, do_averaging):
         """
         parse a batch of sentences
         TODO: change to return object representing
@@ -658,23 +718,23 @@ class Parser(object):
         output: list of System
         """
         res = []
-        self.model.set_train(False)
+        model = self.model if not do_averaging else self.model.averaged
+        model.set_train(False)
         for i in range(0, len(sents), self.batchsize):
             batch = map(lambda s: System.gen(s), sents[i:i+self.batchsize])
             while not all(s.isfinal for s in batch):
-                pred = self.model.predict(batch)
+                pred = model.predict(batch)
                 for j in range(len(batch)):
                     if batch[j].isfinal: continue
                     batch[j] = batch[j].expand(pred[j])
             res.extend(batch)
-        self.model.set_train(True)
+        model.set_train(True)
         return res
 
     def gen_trainexamples(self, sents):
         res = []
         print >> sys.stderr, "creating training examples..."
         for i, sent in enumerate(sents):
-            # if i % 1000 == 0: print >> sys.stderr, i,
             sys.stderr.write("\r{}/{}".format(i, len(sents)))
             sys.stderr.flush()
             s = System.gen(sent)
@@ -684,36 +744,45 @@ class Parser(object):
 
     def train(self, trainsents, testsents, parserfile):
         trainexamples = self.gen_trainexamples(trainsents)
+
         classifier = L.Classifier(self.model)
+        if self.do_averaging:
+            WeightAveraged(self.vocab).setup(self.model)
 
         if self.gpu:
             cuda.get_device().use()
             classifier.to_gpu()
 
-        # optimizer = O.AdaGrad(0.01, 1e-6)
+        # optimizer = O.AdaGrad(.01, 1e-6)
         # optimizer.setup(classifier)
         # optimizer.add_hook(WeightDecay(1e-8))
-        optimizer = O.MomentumSGD(0.05, 0.9)
+        optimizer = O.MomentumSGD(.05, .9)
         optimizer.setup(classifier)
         optimizer.add_hook(WeightDecay(1e-4))
 
-        best_uas = 0.0
+        best_uas = 0.
         print >> sys.stderr, "will run {} iterations".format(self.niters)
         for i in range(1, self.niters+1):
             # lr = initial_lr * 0.96 (iter / decay_steps)
-            lr = 0.05 * 0.96 ** (i / 4000)
+            lr = .05 * .96 ** (i / 4000.)
             optimizer.lr = lr
             batch = random.sample(trainexamples, self.batchsize)
             t = Variable(np.concatenate(map(lambda ex: ex.target, batch)))
             # t = Variable(cuda.cupy.concatenate(map(lambda ex: ex.target, batch)))
             optimizer.update(classifier, batch, t)
+            self.model.averaged.update()
 
             print >> sys.stderr, "Epoch:{}\tloss:{}\tacc:{}".format(
                     i, classifier.loss.data, classifier.accuracy.data)
 
             if i % self.evaliter == 0:
                 print >> sys.stderr, "Evaluating model on dev data..."
-                res = self(testsents)
+                print >> sys.stderr, "without averaging",
+                res = self(testsents, False)
+                uas, las = accuracy(res)
+
+                print >> sys.stderr, "with averaging",
+                res = self(testsents, True)
                 uas, las = accuracy(res)
 
                 if uas > best_uas:
@@ -727,6 +796,7 @@ class Parser(object):
 
     def save(self, path):
         with open(path, "wb") as f:
+            self.vocab.setup_save()
             if self.gpu:
                 self.model.to_cpu()
                 pickle.dump(self, f)
@@ -764,16 +834,24 @@ def accuracy(states, verbose=True):
 #########################################################
 
 def main():
-    tag_path = "../jackknife/data/tags.lst"
-    vocab      = Vocab("chen/words.lst", tag_path, "chen/embeddings.txt")
-    trainsents = vocab.read_conll_train("corpus/wsj_02-21.sd.orig.tagged")
-    vocab.assign_probs(trainsents, "../jackknife/wsj_02-21.probs")
+    tag_path        = "../jackknife/data/tags.lst"
+    word_path       = "chen/words.lst"
+    embed_path      = "chen/embeddings.txt"
+    train_path      = "corpus/wsj_02-21.sd.orig.tagged"
+    train_prob_path = "../jackknife/wsj_02-21.probs"
+    test_path       = "corpus/wsj_23.sd.orig.tagged"
+    test_prob_path  = "../jackknife/wsj_23.probs"
+    out_path        = "parser_syntaxnet.dat"
+    vocab      = Vocab(word_path, tag_path,embed_path)
+    trainsents = vocab.read_conll_train(train_path)
+    vocab.assign_probs(trainsents, train_prob_path)
     for sent in trainsents:
         projectivize(sent)
-    testsents  = vocab.read_conll_test("corpus/wsj_23.sd.orig.tagged")
-    vocab.assign_probs(testsents, "../jackknife/wsj_23.probs")
-    parser     = Parser(vocab, gpu=False, niters=30000)
-    parser.train(trainsents, testsents, "parser_syntaxnet.dat")
+    testsents  = vocab.read_conll_test(test_path)
+    vocab.assign_probs(testsents, test_prob_path)
+    parser     = Parser(vocab, gpu=False, niters=30000,
+            hiddensize=2048, rescale_embed=False, wscale=0.1)
+    parser.train(trainsents, testsents, out_path)
     res        = parser(testsents)
     uas, las   = accuracy(res)
 
