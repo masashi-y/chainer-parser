@@ -1,5 +1,4 @@
 #!/usr/bin/python
-from collections import defaultdict
 from chainer import Chain, Variable
 import chainer.functions as F
 import chainer.optimizers as O
@@ -20,18 +19,17 @@ class Vocab(object):
     pad = "PADDING"
     unk = "UNKNOWN"
 
-    def __init__(self, word_path, tag_path=None, cutoff=1, pretrained_path=None):
+    def __init__(self, word_path, tag_path=None, pretrained_path=None, cutoff=1):
         self.words  = Vocab._read_listfile(word_path)
-        self.labels = defaultdict(lambda: len(self.tags))
-        self.labels[Vocab.unk] = 0
+        self.labels = {Vocab.unk: 0}
         self.freq   = None
         self.cutoff = cutoff
+        self._accept_new_entries = True
 
         if tag_path is not None:
-            self.tags   = Vocab._read_listfile(tag_path)
+            self.tags = Vocab._read_listfile(tag_path, init={Vocab.unk: 0})
         else:
-            self.tags   = defaultdict(lambda: len(self.tags))
-            self.tags[Vocab.unk] = 0
+            self.tags = {Vocab.unk: 0}
 
         if pretrained_path is not None:
             self.pretrained = Vocab._read_pretrained(pretrained_path)
@@ -40,29 +38,23 @@ class Vocab(object):
 
     @staticmethod
     def _freqdict(path):
-        res = defaultdict(lambda: 0)
+        res = {Vocab.unk: 0}
         for line in open(path):
             line = line.strip()
             if len(line) == 0: continue
             items = line.split("\t")
-            word = items[1]
-            res[Vocab.normalize(word)] += 1
+            word = Vocab.normalize(items[1])
+            if res.has_key(word):
+                res[word] += 1
+            else:
+                res[word] = 0
         return res
 
-    def _accept_new_entries(self, acc):
-        if acc:
-            self.tags.default_factory = Vocab._get_id(self.tags)
-            self.labels.default_factory = Vocab._get_id(self.labels)
-        else:
-            self.tags.default_factory = Vocab._get_unk(self.tags)
-            self.labels.default_factory = Vocab._get_unk(self.labels)
-
     @staticmethod
-    def _read_listfile(path):
-        res = defaultdict(lambda: res[Vocab.unk])
-        res[Vocab.unk] = 0
+    def _read_listfile(path, init={}):
+        res = init
         for i, line in enumerate(open(path)):
-            res[line.strip()] = i + 1
+            res[line.strip()] = i
         return res
 
     @staticmethod
@@ -75,16 +67,34 @@ class Vocab(object):
         else:
             return n
 
+    def _get_or_add_entry(self, d, entry):
+        if d.has_key(entry):
+            return d[entry]
+        elif self._accept_new_entries:
+            idx = len(d)
+            d[entry] = idx
+            return idx
+        else:
+            return d[Vocab.unk]
+
     def create_token(self, wstr, tstr, head, lstr):
         norm_wstr = Vocab.normalize(wstr)
-        map_unk   = self.freq[norm_wstr] < self.cutoff
-        word      = self.words[Vocab.unk] if map_unk else self.words[norm_wstr]
-        tag       = self.tags[tstr]
-        label     = self.labels[lstr]
+        word      = self.words.get(norm_wstr, self.words[Vocab.unk])
+        map_unk   = self.freq.get(norm_wstr, 0) < self.cutoff
+        if map_unk: word = self.words[Vocab.unk]
+        tag       = self._get_or_add_entry(self.tags, tstr)
+        label     = self._get_or_add_entry(self.labels, lstr)
         return Token(word, tag, head, label, wstr, tstr, lstr)
 
     def roottoken(self):
-        return self.create_token(Vocab.pad, Vocab.unk, -1, Vocab.unk)
+        return Token(
+                self.words[Vocab.pad],
+                self.tags[Vocab.unk],
+                -1,
+                self.labels[Vocab.unk],
+                Vocab.pad,
+                Vocab.unk,
+                Vocab.unk)
 
     def targetsize(self):
         # NOOP: 0
@@ -96,15 +106,15 @@ class Vocab(object):
         return 2 + 2 * nlabels
 
     def read_conll_train(self, filepath):
-        self._accept_new_entries(True)
+        self._accept_new_entries = True
         if self.freq is None:
             self.freq = self._freqdict(filepath)
         return self._read_conll(filepath)
 
     def read_conll_test(self, filepath):
-        self._accept_new_entries(False)
+        self._accept_new_entries = False
         res = self._read_conll(filepath)
-        self._accept_new_entries(True)
+        self._accept_new_entries = True
         return res
 
     def _read_conll(self, filepath):
@@ -137,8 +147,7 @@ class Vocab(object):
         return res
 
     def _read_probs(self, filepath, top=3):
-        print >> sys.stderr, "reading prob file:", filepath,
-        root = [.0]*len(self.tags)
+        root = [.0] * len(self.tags)
         root[0] = 1.
         root = np.asarray(root, dtype=np.float32)
         res = [[root]]
@@ -149,10 +158,10 @@ class Vocab(object):
                 continue
             items = [0.] + [float(v) for v in line.split("\t")[1:]]
             v = np.asarray(items, dtype=np.float32)
+            # zero out v[tag] for all tags not in top k
             ind = np.argpartition(v, -top)[-top:]
             mask = np.asarray([float(i in ind) for i in range(len(v))], np.float32)
             res[-1].append(v * mask)
-        print >> sys.stderr, "done"
         return res
 
     def assign_probs(self, sents, filepath):
@@ -163,39 +172,14 @@ class Vocab(object):
                 t.tag = p
         print >> sys.stderr, "done"
 
-    @staticmethod
-    def _get_unk(d):
-        return lambda: d[Vocab.unk]
-
-    @staticmethod
-    def _get_id(d):
-        return lambda: len(d)
-
-    def setup_save(self):
-        self.words.default_factory  = None
-        self.tags.default_factory   = None
-        self.labels.default_factory = None
-        if self.freq is not None:
-            self.freq.default_factory = None
-
-    def _load(self):
-        self.words.default_factory  = Vocab._get_id(self.words)
-        self.tags.default_factory   = Vocab._get_id(self.tags)
-        self.labels.default_factory = Vocab._get_id(self.labels)
-        if self.freq is not None:
-            self.freq.default_factory = Vocab._get_id(self.freq)
-
     def save(self, path):
         with open(path, "wb") as f:
-            self.setup_save()
             pickle.dump(self, f)
 
     @staticmethod
     def load(path):
         with open(path) as f:
-            res = pickle.load(f)
-            res._load()
-            return res
+            return pickle.load(f)
 
 class Token(object):
     def __init__(self, word, tag, head, label, wstr, tstr, lstr):
@@ -233,8 +217,8 @@ def projectivize(tokens):
         left  = [-1] * ntokens
         right = [ntokens] * ntokens
 
-        for i in range(ntokens):
-            head = tokens[i].head
+        for i, token in enumerate(tokens):
+            head = token.head
             l = min(i, head)
             r = max(i, head)
 
@@ -244,8 +228,8 @@ def projectivize(tokens):
 
         deepest_arc = -1
         max_depth = 0
-        for i in range(ntokens):
-            head = tokens[i].head
+        for i, token in enumerate(tokens):
+            head = token.head
             if head == 0: continue
             l = min(i, head)
             r = max(i, head)
@@ -384,10 +368,6 @@ class System(object):
         return self.step == 0
 
     @property
-    def nlabels(self):
-        raise Exception("not implemented")
-
-    @property
     def has_input(self):
         return self.right < len(self.tokens)
 
@@ -430,11 +410,8 @@ class System(object):
     def _null(tokens):
         s = System(0, 0.0, 0, 0, None, None, None, None,
                 None, tokens, None, System.NOOP)
-        s.left    = s
-        s.lchild  = s
-        s.rchild  = s
-        s.lsibl   = s
-        s.rsibl   = s
+        s.left, s.lchild, s.rchild = s, s, s
+        s.lsibl, s.rsibl = s, s
         return s
 
     def __str__(self):
@@ -499,8 +476,8 @@ class System(object):
                 [b0.tag, b1.tag, b2.tag, b3.tag, s0.tag, s0l.tag, s0l2.tag,
         s0r.tag, s0r2.tag, s02l.tag, s12r.tag, s1.tag, s1l.tag, s1l2.tag,
         s1r.tag, s1r2.tag, s12l.tag, s12r.tag, s2.tag, s3.tag],
-                dtype=np.float32)
-                # dtype=np.int32)
+                # dtype=np.float32)
+                dtype=np.int32)
 
         labels = np.asarray(
                 [s0rc_label, s0rc2_label, s0lc_label, s0lc2_label, s02l_label,
@@ -558,7 +535,7 @@ class Example(object):
 class FeedForward(Chain):
     def __init__(self, vocab, embedsize=50, hiddensize=1024, use_topk_tags=True,
             token_context_size=20, label_context_size=12, rescale_embed=True,
-            wscale=1., averaging=True):
+            wscale=1.):
         self.wordsize    = len(vocab.words)
         self.tagsize     = len(vocab.tags)
         self.labelsize   = len(vocab.labels)
@@ -569,16 +546,16 @@ class FeedForward(Chain):
 
         super(FeedForward, self).__init__(
                 w_embed = L.EmbedID(self.wordsize, embedsize),
-                t_embed = L.Linear(self.tagsize, embedsize),
-                # t_embed = L.EmbedID(self.tagsize, embedsize),
+                # t_embed = L.Linear(self.tagsize, embedsize),
+                t_embed = L.EmbedID(self.tagsize, embedsize),
                 l_embed = L.EmbedID(self.labelsize, embedsize),
                 linear1 = L.Linear(self.contextsize, hiddensize, wscale=wscale),
                 linear2 = L.Linear(hiddensize, self.targetsize, wscale=wscale)
                 )
 
         # to ensure most ReLU units to activate in the first epochs
-        self.linear1.b.data[:] = .2
-        self.linear2.b.data[:] = .2
+        # self.linear1.b.data[:] = .2
+        # self.linear2.b.data[:] = .2
 
         if vocab.pretrained is not None:
             self.w_embed.W = Variable(vocab.pretrained)
@@ -593,7 +570,6 @@ class FeedForward(Chain):
         print >> sys.stderr, "(mean={:0.4f}, std={:0.4f})".format(
             np.mean(self.linear2.W.data), np.std(self.linear2.W.data))
 
-        self.averaged = None
         self.train = True
         self.drop_rate = .5
 
@@ -618,22 +594,21 @@ class FeedForward(Chain):
         # label_ids = cuda.cupy.concatenate(label_ids).reshape((-1, len(batch)))
         # valids = cuda.cupy.concatenate(valids).reshape((-1, len(batch)))
         word_ids = np.asarray(word_ids)
-        # tag_ids  = np.asarray(tag_ids)
-        tag_ids = np.concatenate(tag_ids)
+        tag_ids  = np.asarray(tag_ids)
+        # tag_ids = np.concatenate(tag_ids)
         label_ids = np.asarray(label_ids)
         valids = np.asarray(valids)
 
         # batch x token x embedsize
         h_w = self.w_embed(word_ids)
         h_t = self.t_embed(tag_ids)
-        h_t = F.reshape(h_t, (-1, 20, self.embedsize))
+        # h_t = F.reshape(h_t, (-1, 20, self.embedsize))
         h_l = self.l_embed(label_ids)
 
         # batch x [w; t; l] x embedsize
         h  = F.concat([h_w, h_t, h_l], 1)
         h1 = F.relu(self.linear1(h))
-        # h2 = F.dropout(h1, ratio=self.drop_rate, train=self.train)
-        h2 = h1
+        h2 = F.dropout(h1, ratio=self.drop_rate, train=self.train)
         h3 = self.linear2(h2)
         return h3 * valids
 
@@ -651,36 +626,52 @@ class FeedForward(Chain):
         with open(path) as f:
             return pickle.load(f)
 
-class WeightAveraged(FeedForward):
+class WeightAveragedFF(FeedForward):
     def __init__(self, vocab, decay=0.99, **args):
-        super(WeightAveraged, self).__init__(vocab, rescale_embed=False, **args)
+        super(WeightAveragedFF, self).__init__(vocab, **args)
         self.decay = decay
-        self.step = 1
+        self.avg = FeedForward(vocab, **args)
+        self.setup()
 
-    def setup(self, model):
-        self.params = model.__dict__["_children"]
-        for param in self.params:
+    def predict(self, states):
+        return self.avg.predict(states)
+
+    def setup(self):
+        self.ave_params = self.__dict__["_children"]
+        for param in self.ave_params:
             p = getattr(self, param)
-            q = getattr(model, param)
+            q = getattr(self.avg, param)
 
             if type(p) == L.EmbedID:
-                p.W.data = q.W.data.copy()
+                print param
+                q.W.data = p.W.data.copy()
             elif type(p) == L.Linear:
-                p.W.data = q.W.data.copy()
-                p.b.data = q.b.data.copy()
+                print param
+                q.W.data = p.W.data.copy()
+                q.b.data = p.b.data.copy()
 
-        model.averaged = self
-        self.parent = model
-
-    def update(self):
-        for param in self.params:
-            alpha = min(self.decay, (1. + self.step) / (10. + self.step))
+    def update_averaged(self, step):
+        for param in self.ave_params:
+            alpha = min(self.decay, (1. + step) / (10. + step))
             p = getattr(self, param)
-            q = getattr(self.parent, param)
-            p.W.data = alpha * p.W.data + (1 - alpha) * q.W.data
+            q = getattr(self.avg, param)
+            q.W.data = alpha * q.W.data + (1 - alpha) * p.W.data
             if type(p) == L.Linear:
-                p.b.data = alpha * p.b.data + (1 - alpha) * q.b.data
+                q.b.data = alpha * q.b.data + (1 - alpha) * p.b.data
+
+class ExponentialMovingAverage(object):
+    # no support for GPU
+    def __init__(self, initial_lr=.05, decay=0.96, decay_steps=4000):
+        self.initial_lr  = initial_lr
+        self.decay       = decay
+        self.decay_steps = float(decay_steps)
+        self.step = 1
+
+    def __call__(self, opt):
+        # lr = initial_lr * 0.96 (iter / decay_steps)
+        opt.lr = self.initial_lr * self.decay ** (self.step / self.decay_steps)
         self.step += 1
+
 
 def rescale(embed, rmean, rstd):
     print >> sys.stderr, "scaling embedding"
@@ -697,19 +688,18 @@ def rescale(embed, rmean, rstd):
 #########################################################
 
 class Parser(object):
-    def __init__(self, vocab, batchsize=10000, niters=20000,
-            do_averaging=True, evaliter=200, gpu=False, **args):
+    def __init__(self, vocab, model=FeedForward, batchsize=10000,
+            niters=20000, do_averaging=True, evaliter=200, gpu=False, **args):
         self.vocab        = vocab
         self.batchsize    = batchsize
         self.niters       = niters
         self.evaliter     = evaliter
-        self.model        = FeedForward(vocab, **args)
+        self.model        = model(vocab, **args)
         self.targetsize   = vocab.targetsize()
-        self.do_averaging = do_averaging
         self.gpu          = gpu
         print >> sys.stderr, "gpu =", gpu
 
-    def __call__(self, sents, do_averaging):
+    def __call__(self, sents):
         """
         parse a batch of sentences
         TODO: change to return object representing
@@ -718,17 +708,16 @@ class Parser(object):
         output: list of System
         """
         res = []
-        model = self.model if not do_averaging else self.model.averaged
-        model.set_train(False)
+        self.model.set_train(False)
         for i in range(0, len(sents), self.batchsize):
             batch = map(lambda s: System.gen(s), sents[i:i+self.batchsize])
             while not all(s.isfinal for s in batch):
-                pred = model.predict(batch)
+                pred = self.model.predict(batch)
                 for j in range(len(batch)):
                     if batch[j].isfinal: continue
                     batch[j] = batch[j].expand(pred[j])
             res.extend(batch)
-        model.set_train(True)
+        self.model.set_train(True)
         return res
 
     def gen_trainexamples(self, sents):
@@ -744,45 +733,36 @@ class Parser(object):
 
     def train(self, trainsents, testsents, parserfile):
         trainexamples = self.gen_trainexamples(trainsents)
-
         classifier = L.Classifier(self.model)
-        if self.do_averaging:
-            WeightAveraged(self.vocab).setup(self.model)
 
         if self.gpu:
             cuda.get_device().use()
             classifier.to_gpu()
 
-        # optimizer = O.AdaGrad(.01, 1e-6)
-        # optimizer.setup(classifier)
-        # optimizer.add_hook(WeightDecay(1e-8))
-        optimizer = O.MomentumSGD(.05, .9)
+        optimizer = O.AdaGrad(.01, 1e-6)
         optimizer.setup(classifier)
-        optimizer.add_hook(WeightDecay(1e-4))
+        optimizer.add_hook(WeightDecay(1e-8))
+        # optimizer = O.MomentumSGD(.05, .9)
+        # optimizer.setup(classifier)
+        # optimizer.add_hook(WeightDecay(1e-4))
+        # optimizer.add_hook(ExponentialMovingAverage())
 
         best_uas = 0.
         print >> sys.stderr, "will run {} iterations".format(self.niters)
-        for i in range(1, self.niters+1):
-            # lr = initial_lr * 0.96 (iter / decay_steps)
-            lr = .05 * .96 ** (i / 4000.)
-            optimizer.lr = lr
+        for step in range(1, self.niters+1):
             batch = random.sample(trainexamples, self.batchsize)
             t = Variable(np.concatenate(map(lambda ex: ex.target, batch)))
             # t = Variable(cuda.cupy.concatenate(map(lambda ex: ex.target, batch)))
             optimizer.update(classifier, batch, t)
-            self.model.averaged.update()
+            if type(self.model) == WeightAveragedFF:
+                self.model.update_averaged(step)
 
             print >> sys.stderr, "Epoch:{}\tloss:{}\tacc:{}".format(
-                    i, classifier.loss.data, classifier.accuracy.data)
+                    step, classifier.loss.data, classifier.accuracy.data)
 
-            if i % self.evaliter == 0:
+            if step % self.evaliter == 0:
                 print >> sys.stderr, "Evaluating model on dev data..."
-                print >> sys.stderr, "without averaging",
-                res = self(testsents, False)
-                uas, las = accuracy(res)
-
-                print >> sys.stderr, "with averaging",
-                res = self(testsents, True)
+                res = self(testsents)
                 uas, las = accuracy(res)
 
                 if uas > best_uas:
@@ -796,7 +776,6 @@ class Parser(object):
 
     def save(self, path):
         with open(path, "wb") as f:
-            self.vocab.setup_save()
             if self.gpu:
                 self.model.to_cpu()
                 pickle.dump(self, f)
@@ -842,15 +821,16 @@ def main():
     test_path       = "corpus/wsj_23.sd.orig.tagged"
     test_prob_path  = "../jackknife/wsj_23.probs"
     out_path        = "parser_syntaxnet.dat"
-    vocab      = Vocab(word_path, tag_path,embed_path)
+    vocab      = Vocab(word_path, tag_path, embed_path)
     trainsents = vocab.read_conll_train(train_path)
-    vocab.assign_probs(trainsents, train_prob_path)
+    # vocab.assign_probs(trainsents, train_prob_path)
     for sent in trainsents:
         projectivize(sent)
     testsents  = vocab.read_conll_test(test_path)
-    vocab.assign_probs(testsents, test_prob_path)
-    parser     = Parser(vocab, gpu=False, niters=30000,
-            hiddensize=2048, rescale_embed=False, wscale=0.1)
+    # vocab.assign_probs(testsents, test_prob_path)
+    parser     = Parser(vocab, model=FeedForward, gpu=False, niters=40000, evaliter=400)
+    # parser     = Parser(vocab, model=WeightAveragedFF, gpu=False, niters=30000,
+    #                     evaliter=400, hiddensize=2048, rescale_embed=False, wscale=0.1)
     parser.train(trainsents, testsents, out_path)
     res        = parser(testsents)
     uas, las   = accuracy(res)
