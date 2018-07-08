@@ -2,6 +2,7 @@ import asciitree
 import numpy as np
 import pickle
 import sys
+import argparse
 from pathlib import Path
 from collections import OrderedDict, deque
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Iterator
@@ -61,14 +62,15 @@ def read_vocab(path: Path) -> Dict[str, int]:
     res = {UNK: UNK_ID}
     for line in path.open():
         entry = line.strip()
-        assert entry not in res, \
-            ('failure is Dataloader.read_vocab: '
-            f'duplicate entry: {entry}.')
+        # assert entry not in res, \
+        #     ('failure is Dataloader.read_vocab: '
+        #     f'duplicate entry: {entry}.')
         res[entry] = len(res)
     return res
 
 
 def read_pretrained(path: Path) -> Array:
+    log(f'loading pretrained embeddings from {path}')
     io = open(path)
     dim = len(io.readline().split())
     io.seek(0)
@@ -274,22 +276,24 @@ class DataLoader(object):
             kwargs['tag_ids'].append(self.tags[items[3]])
             kwargs['label_ids'].append(self.labels[items[7]])
 
-    def read_conll_test(self, filename: Path) -> Iterator[Sentence]:
-        sents = self.read_conll(filename, False)
+    def read_conll_test(self, filename: Path) -> List[Sentence]:
+        sents = list(self.read_conll(filename, False))
         return sents
 
-    def read_conll_train(self, filename: Path) -> Iterator[Sentence]:
+    def read_conll_train(self, filename: Path) -> List[Sentence]:
         """
             load CoNLL sentences, update vocabulary (`DataLoader.words`)
             and add entries for new words to the pretrained embedding matrix.
         """
-        sents = self.read_conll(filename, True)
+        sents = list(self.read_conll(filename, True))
         if self.pretrained is not None:
+            log('adding entries for new words to the pretrained embeddings')
             old_vocab_size, units = self.pretrained.shape
             new_pretrained = 0.02 * np.random.random_sample(
                                     (len(self.words), units)) - 0.01
             new_pretrained[:old_vocab_size, :] = self.pretrained
             self.pretrained = new_pretrained
+            log(f'done. {old_vocab_size} ---> {len(self.words)}')
         return sents
 
     def save(self, filename: Path) -> None:
@@ -596,7 +600,7 @@ def oracle_states(
                 gold_action = Action.SHIFT
         valid_actions = np.array( [s.is_valid(action) \
                 for action in range(action_size)] ).astype(float)
-        gold_action = np.array([gold_action], int)
+        gold_action = np.array(gold_action, int)
         words, tags, labels = s.feature_set()
         res.append(
             (words, tags, labels, valid_actions, gold_action))
@@ -620,8 +624,6 @@ class FeedForwardNetwork(chainer.Chain):
             action_size: int,
             embed_units: int = 50,
             hidden_units: int = 1024,
-            token_context_size: int = 20,
-            label_context_size: int = 12,
             rescale_embeddings: bool = True,
             pretrained: Optional[Array] = None) -> None:
         self.word_size = word_size
@@ -629,6 +631,8 @@ class FeedForwardNetwork(chainer.Chain):
         self.label_size = label_size
         self.action_size = action_size
         self.embed_units = embed_units
+        token_context_size: int = 20
+        label_context_size: int = 12
         self.contextsize = embed_units * \
                 (token_context_size * 2 + label_context_size)
         super().__init__()
@@ -637,10 +641,8 @@ class FeedForwardNetwork(chainer.Chain):
                         self.word_size, embed_units, initialW=pretrained)
                 self.t_embed = L.EmbedID(self.tag_size, embed_units)
                 self.l_embed = L.EmbedID(self.label_size, embed_units)
-                self.linear1 = L.Linear(
-                        self.contextsize, hidden_units)
-                self.linear2 = L.Linear(
-                        hidden_units, self.action_size)
+                self.linear1 = L.Linear(self.contextsize, hidden_units)
+                self.linear2 = L.Linear(hidden_units, self.action_size)
 
         # to ensure most ReLU units to activate in the first epochs
         self.linear1.b.data[:] = .2
@@ -728,15 +730,15 @@ class ShiftReduceParser(object):
             val_interval: Tuple[int, str] = (1000, 'iteration'),
             log_interval: Tuple[int, str] = (200, 'iteration'),
             ) -> None:
-    
+
         if init_model:
             log('Load model from %s' % init_model)
             chainer.serializers.load_npz(init_model, self.model)
-    
+
         if gpu >= 0:
             chainer.cuda.get_device(gpu).use()
             self.model.to_gpu()
-    
+
         TRAIN = [example for sent in train_sents \
                             for example in oracle_states(sent, action_size)]
         log(f'the size of training examples: {len(TRAIN)}')
@@ -747,17 +749,17 @@ class ShiftReduceParser(object):
         log(f'the size of validation examples: {len(VALID)}')
         val_iter = chainer.iterators.SerialIterator(
                     VALID, batch_size, repeat=False, shuffle=False)
-    
+
         optimizer = chainer.optimizers.AdaGrad(.01, 1e-6)
         optimizer.setup(self.model)
         optimizer.add_hook(WeightDecay(1e-8))
-    
+
         updater = training.updaters.StandardUpdater(
             train_iter,
             optimizer,
             device = gpu,
             converter=chainer.dataset.concat_examples)
-        
+
         trainer = training.Trainer(
             updater,
             (epoch, 'epoch'),
@@ -787,7 +789,7 @@ class ShiftReduceParser(object):
         trainer.extend(extensions.LogReport(trigger=log_interval))
         trainer.extend(extensions.ProgressBar(update_interval=10))
         trainer.run()
-    
+
     def evaluate(self, sents: List[Sentence]) -> None:
         pass
 
@@ -812,15 +814,16 @@ def main():
     train.add_argument('--epoch', type = int, default = 10000)
     train.add_argument('--batch-size', type = int, default = 10000)
     train.add_argument('--gpu', type = int, default = -1)
+    args = parser.parse_args()
 
     loader = DataLoader(args.WORD, args.TAG, args.LABEL, args.pretrained)
     loader.save(args.PATH / 'loader.pickle')
 
-    train_sents = list(loader.read_conll_train(args.TRAIN))
+    train_sents = loader.read_conll_train(args.TRAIN)
     for sent in train_sents:
         sent.projectivize()
 
-    valid_sents = list(loader.read_conll_test(args.VALID))
+    valid_sents = loader.read_conll_test(args.VALID)
     for sent in valid_sents:
         sent.projectivize()
 
@@ -844,8 +847,8 @@ def main():
             args.epoch,
             args.batch_size,
             args.gpu,
-            (1000, 'iteration'),
-            (200, 'iteration'),
+            (2000, 'iteration'),
+            (400, 'iteration'),
     )
 
 
