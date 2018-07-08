@@ -1,6 +1,7 @@
 from pathlib import Path
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Iterator
+from chainer.optimizer import WeightDecay
 import asciitree
 import chainer
 from chainer import dataset, Variable
@@ -629,4 +630,79 @@ class FeedForwardNetwork(chainer.Chain):
         h = F.dropout(h, ratio=0.5)
         h = self.linear2(h)
         return h * valid_actions
+
+
+class ShiftReduceParser(object):
+    def __init__(self,
+                model: FeedForwardNetwork) -> None:
+        self.model = model
+
+    def _parse(self,
+            sents: List[Sentence],
+            batchsize: int = 1000) -> State:
+        res = [None for _ in sents]
+        queue = deque((i, State.of_sent(s)) for i, s in enumerate(sents))
+        while len(queue) > 0:
+            batch = [queue.pop() for _ in range(min(batchsize, len(queue)))]
+            ids, states = zip(*batch)
+            with chainer.no_backprop_mode(), \
+                    chainer.using_config('train', False):
+                preds = self.model.predict(states)
+            for i, state, action in zip(ids, states, preds):
+                state = state.expand(action)
+                if state.isfinal:
+                    res[i] = state
+                else:
+                    queue.append((i, state))
+        assert (s is not None for s in res)
+        return res
+
+    def train(self,
+            out_dir: Path,
+            init_model: Path,
+            epoch: int = 10000,
+            batchsize: int = 10000,
+            gpu: int = -1,
+            val_interval: Tuple[int, str] = (1000, 'iteration'),
+            log_interval: Tuple[int, str] = (200, 'iteration'),
+            ) -> None:
+
+        if init_model:
+            log('Load model from %s' % init_model)
+            chainer.serializers.load_npz(init_model, self.model)
+
+        if gpu >= 0:
+            chainer.cuda.get_device(gpu).use()
+            self.model.to_gpu()
+
+        # TRAIN = LSTMParserDataset(args.MODEL, model.extractor, args.TRAIN)
+        train_iter = chainer.iterators.SerialIterator(TRAIN, self.batchsize)
+        # VAL = LSTMParserDataset(args.MODEL, model.extractor, args.VAL)
+        val_iter = chainer.iterators.SerialIterator(
+                    VAL, self.batchsize, repeat=False, shuffle=False)
+
+        optimizer = chainer.optimizers.AdaGrad(.01, 1e-6)
+        optimizer.setup(self.model)
+        optimizer.add_hook(WeightDecay(1e-8))
+
+        updater = training.updaters.StandardUpdater(
+                # train_iter, optimizer, device=gpu, converter=model.convert)
+
+        trainer = training.Trainer(updater, (epoch, 'epoch'), out_dir)
+        trainer.extend(extensions.Evaluator(val_iter, self.model,
+                # model.convert, device=gpu), trigger=val_interval)
+        trainer.extend(extensions.snapshot_object(
+                self.model, 'model_iter_{.updater.iteration}'),
+                trigger=val_interval)
+        trainer.extend(extensions.LogReport(trigger=log_interval))
+        trainer.extend(extensions.PrintReport([
+            'epoch', 'iteration',
+            'main/accuracy', 'main/loss',
+            'validation/main/accuracy',
+        ]), trigger=log_interval)
+        trainer.extend(extensions.ProgressBar(update_interval=10))
+        trainer.run()
+
+    def evaluate(self, sents: List[Sentence]) -> None:
+        pass
 
