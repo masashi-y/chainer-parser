@@ -1,14 +1,17 @@
+import asciitree
+import numpy as np
+import pickle
+import sys
 from pathlib import Path
 from collections import OrderedDict, deque
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Iterator
-from chainer.optimizer import WeightDecay
-import asciitree
+
 import chainer
-from chainer import dataset, Variable
+from chainer import Variable, training
+from chainer.training import extensions
+from chainer.optimizer import WeightDecay
 import chainer.functions as F
 import chainer.links as L
-from chainer import reporter
-import numpy as np
 
 # try:
 #     import cupy
@@ -21,7 +24,16 @@ FeatureSet = NamedTuple(
     'FeatureSet',
     [('words', VariableOrArray),
     ('tags', VariableOrArray),
-    ('labels', VariableOrArray)
+    ('labels', VariableOrArray),
+])
+
+TrainingExample = NamedTuple(
+    'TrainingExample',
+    [('words', VariableOrArray),
+    ('tags', VariableOrArray),
+    ('labels', VariableOrArray),
+    ('valid_actions', VariableOrArray),
+    ('gold_action', VariableOrArray),
 ])
 
 UNK = 'UNKNOWN'
@@ -71,40 +83,6 @@ def read_pretrained(path: Path) -> Array:
     return res
 
 
-class DataLoader(object):
-    def __init__(self,
-                word_path: Path,
-                tag_path: Path,
-                label_path: Path,
-                pretrained_path: Optional[Path] = None) -> None:
-        self.words = read_vocab(word_path)
-        self.tags = read_vocab(tag_path)
-        self.labels = read_vocab(label_path)
-        self._accept_new_entries = True
-        self.pretrained = read_pretrained(pretrained_path) \
-                if pretrained_path is not None else None
-
-    def _get_or_add_entry(self, entry: str) -> int:
-        if entry in self.words:
-            return self.words[entry]
-        elif self._accept_new_entries:
-            idx = len(self.words)
-            self.words[entry] = idx
-            return idx
-        else:
-            return UNK_ID
-
-    def action_size(self) -> int:
-        """
-            NOOP -> 0
-            SHIFT -> 1
-            REDUCEL(action_id) -> some n >= 2 and n is even
-            REDUCER(action_id) -> some n >= 2 and n is odd
-            REDUCE(0) -> REDUCE(UNKNOWN) is ignored
-        """
-        nlabels = len(self.labels) - 1
-        return 2 + 2 * nlabels
-
 
 class Sentence(object):
     def __init__(self,
@@ -114,15 +92,20 @@ class Sentence(object):
             tags2:  List[str],
             labels: List[str],
             heads:  List[int],
+            word_ids:  Array,
+            tag_ids:   Array,
+            label_ids: Array,
             root_node = True) -> None:
-        self.words  = words
+        self.words = words
         self.lemmas = lemmas
-        self.tags1  = tags1
-        self.tags2  = tags2
+        self.tags1 = tags1
+        self.tags2 = tags2
         self.labels = labels
-        self.heads  = heads
+        self.heads = heads
+        self.word_ids = word_ids
+        self.tag_ids = tag_ids
+        self.label_ids = label_ids
         self.root_node = root_node
-        self.orig_heads: Optional[List[int]] = None
 
     @property
     def start(self):
@@ -145,25 +128,11 @@ class Sentence(object):
                 self.labels[i],
                 '-', 
                 '-' ]
-            res += '\n'.join(items)
+            res += '\t'.join(items) + '\n'
         return res
 
     def __len__(self) -> int:
         return len(self.words)
-
-    @staticmethod
-    def empty(root = True) -> 'Sentence':
-        return Sentence(
-            [PAD], [PAD], [UNK], [UNK], [UNK], [0], root_node = root)
-
-    def append(self, word: str, lemma: str, tag1: str,
-                     tag2: str, label: str, head: int) -> None:
-        self.words.append(word)
-        self.lemmas.append(lemma)
-        self.tags1.append(tag1)
-        self.tags2.append(tag2)
-        self.labels.append(label)
-        self.heads.append(head)
 
     def visualize(self) -> str:
         token_str = ['root']
@@ -191,7 +160,6 @@ class Sentence(object):
             if the resulting tree is projective the process ends, while not,
             go on to look for another candidate arc to projectivize.
         """
-        self.orig_heads = self.heads[:]
         ntokens = len(self)
         while True:
             left  = [-1] * ntokens
@@ -229,25 +197,110 @@ class Sentence(object):
             self.heads[deepest_arc] = lifted_head
 
 
-def read_conll(filename: Path) -> Iterator[Sentence]:
-    """
-    reads .conll file and returns a list of Sentence
-    """
-    sent = Sentence.empty(root = True)
-    for line in filename.open():
-        line = line.strip()
-        if line == '':
-            yield sent
-            sent = Sentence.empty(root = True)
-        items = line.split('\t')
-        sent.append(
-            word = items[1],
-            lemma = items[2],
-            tag1 = items[3],
-            tag2 = items[4],
-            label = items[7],
-            head = int(items[6]),
+class DataLoader(object):
+    def __init__(self,
+                word_path: Path,
+                tag_path: Path,
+                label_path: Path,
+                pretrained_path: Optional[Path] = None) -> None:
+        self.words = read_vocab(word_path)
+        self.tags = read_vocab(tag_path)
+        self.labels = read_vocab(label_path)
+        self.pretrained = read_pretrained(pretrained_path) \
+                if pretrained_path is not None else None
+
+    def _get_or_add_entry(
+            self, entry: str, accept_new_entry: bool) -> int:
+        entry = normalize(entry)
+        if entry in self.words:
+            return self.words[entry]
+        elif accept_new_entry:
+            idx = len(self.words)
+            self.words[entry] = idx
+            return idx
+        else:
+            return UNK_ID
+
+    @property
+    def action_size(self) -> int:
+        """
+            NOOP -> 0
+            SHIFT -> 1
+            REDUCEL(action_id) -> some n >= 2 and n is even
+            REDUCER(action_id) -> some n >= 2 and n is odd
+            REDUCE(0) -> REDUCE(UNKNOWN) is ignored
+        """
+        nlabels = len(self.labels) - 1
+        return 2 + 2 * nlabels
+
+    def read_conll(
+                self,
+                filename: Path,
+                accept_new_entry: bool = True) -> Iterator[Sentence]:
+        """
+        reads .conll file and returns a list of Sentence
+        """
+        def new_kwargs() -> Dict[str, List]:
+            return dict(
+            words = [PAD],
+            lemmas = [PAD],
+            tags1 = [UNK],
+            tags2 = [UNK],
+            labels = [UNK],
+            heads = [0],
+            word_ids = [PAD_ID],
+            tag_ids = [UNK_ID],
+            label_ids = [UNK_ID],
         )
+        kwargs = new_kwargs()
+        for line in filename.open():
+            line = line.strip()
+            if line == '':
+                kwargs['word_ids'] = np.asarray(kwargs['word_ids'], int)
+                kwargs['tag_ids'] = np.asarray(kwargs['tag_ids'], int)
+                kwargs['label_ids'] = np.asarray(kwargs['label_ids'], int)
+                yield Sentence(**kwargs)
+                kwargs = new_kwargs()
+                continue
+            items = line.split('\t')
+            kwargs['words'].append(items[1])
+            kwargs['lemmas'].append(items[2])
+            kwargs['tags1'].append(items[3])
+            kwargs['tags2'].append(items[4])
+            kwargs['labels'].append(items[7])
+            kwargs['heads'].append(int(items[6]))
+            kwargs['word_ids'].append(
+                    self._get_or_add_entry(items[1], accept_new_entry))
+            kwargs['tag_ids'].append(self.tags[items[3]])
+            kwargs['label_ids'].append(self.labels[items[7]])
+
+    def read_conll_test(self, filename: Path) -> Iterator[Sentence]:
+        sents = self.read_conll(filename, False)
+        return sents
+
+    def read_conll_train(self, filename: Path) -> Iterator[Sentence]:
+        """
+            load CoNLL sentences, update vocabulary (`DataLoader.words`)
+            and add entries for new words to the pretrained embedding matrix.
+        """
+        sents = self.read_conll(filename, True)
+        if self.pretrained is not None:
+            old_vocab_size, units = self.pretrained.shape
+            new_pretrained = 0.02 * np.random.random_sample(
+                                    (len(self.words), units)) - 0.01
+            new_pretrained[:old_vocab_size, :] = self.pretrained
+            self.pretrained = new_pretrained
+        return sents
+
+    def save(self, filename: Path) -> None:
+        with filename.open('wb') as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def load(filename: Path) -> 'DataLoader':
+        with filename.open() as f:
+            return pickle.load(f)
+
 
 
 ########################################################################
@@ -339,17 +392,17 @@ class State(object):
                 f'unexpected action id in State.is_valid: {act}')
 
     def shift(self, act: int) -> 'State':
-        empty = LabeledState(
-            State._empty(self.sent),
+        dummy = LabeledState(
+            State._dummy(self.sent),
             UNK_ID)
         return State(
                 top = self.right,
                 right = self.right + 1,
                 left = self,
-                lchild1 = empty,
-                rchild1 = empty,
-                lchild2 = empty,
-                rchild2 = empty,
+                lchild1 = dummy,
+                rchild1 = dummy,
+                lchild2 = dummy,
+                rchild2 = dummy,
                 sent = self.sent,
                 prev = self,
                 prevact = act)
@@ -396,10 +449,10 @@ class State(object):
 
     def to_heads(self) -> List[int]:
         def rec(s: State) -> None:
-            if not s.prev.is_empty:
-                if not s.lchild1.state.is_empty:
+            if not s.prev.is_dummy:
+                if not s.lchild1.state.is_dummy:
                     res[s.lchild1.state.top] = s.top
-                if not s.rchild1.state.is_empty:
+                if not s.rchild1.state.is_dummy:
                     res[s.rchild1.state.top] = s.top
                 rec(s.prev)
         res = [-1] * len(self.sent)
@@ -408,7 +461,7 @@ class State(object):
 
     def to_labels(self) -> List[int]:
         def rec(s: State) -> None:
-            if not s.prev.is_empty:
+            if not s.prev.is_dummy:
                 act_type = Action.to_type(s.prevact)
                 if act_type == Action.REDUCEL:
                     res[s.lchild1.state.top] = s.lchild1.label
@@ -420,7 +473,7 @@ class State(object):
         return res
 
     @property
-    def is_empty(self) -> bool:
+    def is_dummy(self) -> bool:
         return self.top == 0 and self.right == 0
 
     @property
@@ -429,7 +482,7 @@ class State(object):
 
     @property
     def reducible(self) -> bool:
-        return not self.left.is_empty
+        return not self.left.is_dummy
 
     @property
     def is_final(self) -> bool:
@@ -437,22 +490,22 @@ class State(object):
 
     @staticmethod
     def of_sent(sent: Sentence) -> 'State':
-        empty_state = State._empty(sent)
-        empty = LabeledState(empty_state, UNK_ID)
+        dummy_state = State._dummy(sent)
+        dummy = LabeledState(dummy_state, UNK_ID)
         return State(
                 top = 0,
                 right = 1,
-                left = empty_state,
-                lchild1 = empty,
-                rchild1 = empty,
-                lchild2 = empty,
-                rchild2 = empty,
+                left = dummy_state,
+                lchild1 = dummy,
+                rchild1 = dummy,
+                lchild2 = dummy,
+                rchild2 = dummy,
                 sent = sent,
-                prev = empty_state,
+                prev = dummy_state,
                 prevact = Action.NOOP)
 
     @staticmethod
-    def _empty(sent: Sentence) -> 'State':
+    def _dummy(sent: Sentence) -> 'State':
         state = State(0, 0, None, None, # type: ignore
                 None, None, None, sent, None, Action.NOOP)
         labeled = LabeledState(state, UNK_ID)
@@ -465,7 +518,7 @@ class State(object):
 
     def __str__(self) -> str:
         def rec(s: State, stack: List[str]) -> List[str]:
-            if not s.is_empty:
+            if not s.is_dummy:
                 stack = rec(s.left, stack)
                 stack.append(
                     f'{self.sent.words[self.top]}/{self.sent.tags1[self.top]}')
@@ -476,7 +529,7 @@ class State(object):
                         self.sent.tags1[self.right:]) ]
         return f'[{" ".join(stack)}] [{" ".join(buff)}]'
 
-    def sparse_features(self) -> FeatureSet:
+    def feature_set(self) -> FeatureSet:
         def idx_or_zero(idx: int) -> int:
             return idx if idx < len(self.sent) else 0
 
@@ -502,7 +555,7 @@ class State(object):
               self.left.left.left.top                    # s3
         ]
 
-        labels =  np.asarray(
+        labels = np.asarray(
                  [self.rchild1.label,                    # s0rc
                   self.rchild2.label,                    # s0rc2
                   self.lchild1.label,                    # s0lc
@@ -515,36 +568,44 @@ class State(object):
                   self.left.lchild2.label,               # s1lc2
                   self.left.lchild1.state.lchild1.label, # s12l
                   self.left.rchild1.state.rchild1.label  # s12r
-        ], np.int32)
+        ], int)
 
-        words = self.sent.ws[idx]
-        tags = self.sent.ts[idx]
+        words = self.sent.word_ids[idx]
+        tags = self.sent.tag_ids[idx]
         return FeatureSet(words, tags, labels)
 
 
-def oracle_states(sent: Sentence) -> List[Tuple[FeatureSet, int]]:
+def oracle_states(
+        sent: Sentence,
+        action_size: int) -> List[TrainingExample]:
     def rec(s: State) -> None:
         if s.is_final: return
-        s0h = sent.heads[s.top]
-        s1h = sent.heads[s.left.top]
         if not s.reducible: 
             gold_action = Action.SHIFT
-        elif s1h == s.top:
-            label = sent.ls[s.left.top]
-            gold_action = Action.reducel(label)
-        elif s0h == s.left.top and \
-            all(h != s.top for h in sent.heads[s.right:]):
-            label = sent.ls[s.top]
-            gold_action = Action.reducer(label)
         else:
-            gold_action = Action.SHIFT
-        features = s.sparse_features()
-        res.append((features, gold_action))
+            s0h = sent.heads[s.top]
+            s1h = sent.heads[s.left.top]
+            if s1h == s.top:
+                label = sent.label_ids[s.left.top]
+                gold_action = Action.reducel(label)
+            elif s0h == s.left.top and \
+                all(h != s.top for h in sent.heads[s.right:]):
+                label = sent.label_ids[s.top]
+                gold_action = Action.reducer(label)
+            else:
+                gold_action = Action.SHIFT
+        valid_actions = np.array( [s.is_valid(action) \
+                for action in range(action_size)] ).astype(float)
+        gold_action = np.array([gold_action], int)
+        words, tags, labels = s.feature_set()
+        res.append(
+            (words, tags, labels, valid_actions, gold_action))
         rec(s.expand(gold_action))
-    res: List[Tuple[FeatureSet, int]] = []
+    res: List[TrainingExample] = []
     state = State.of_sent(sent)
     rec(state)
     return res
+
 
 ########################################################################
 ############################  Neural Networks  #########################
@@ -553,34 +614,33 @@ def oracle_states(sent: Sentence) -> List[Tuple[FeatureSet, int]]:
 
 class FeedForwardNetwork(chainer.Chain):
     def __init__(self,
-            wordsize: int,
-            tagsize: int,
-            labelsize: int,
-            targetsize: int,
+            word_size: int,
+            tag_size: int,
+            label_size: int,
+            action_size: int,
             embed_units: int = 50,
             hidden_units: int = 1024,
             token_context_size: int = 20,
             label_context_size: int = 12,
             rescale_embeddings: bool = True,
-            wscale: float = 1.,
             pretrained: Optional[Array] = None) -> None:
-        self.wordsize = wordsize
-        self.tagsize = tagsize
-        self.labelsize = labelsize
-        self.targetsize = targetsize
+        self.word_size = word_size
+        self.tag_size = tag_size
+        self.label_size = label_size
+        self.action_size = action_size
         self.embed_units = embed_units
         self.contextsize = embed_units * \
                 (token_context_size * 2 + label_context_size)
         super().__init__()
         with self.init_scope():
                 self.w_embed = L.EmbedID(
-                        self.wordsize, embed_units, pretrained=pretrained)
-                self.t_embed = L.EmbedID(self.tagsize, embed_units)
-                self.l_embed = L.EmbedID(self.labelsize, embed_units)
+                        self.word_size, embed_units, initialW=pretrained)
+                self.t_embed = L.EmbedID(self.tag_size, embed_units)
+                self.l_embed = L.EmbedID(self.label_size, embed_units)
                 self.linear1 = L.Linear(
-                        self.contextsize, hidden_units, wscale = wscale)
+                        self.contextsize, hidden_units)
                 self.linear2 = L.Linear(
-                        hidden_units, self.targetsize, wscale = wscale)
+                        hidden_units, self.action_size)
 
         # to ensure most ReLU units to activate in the first epochs
         self.linear1.b.data[:] = .2
@@ -621,29 +681,28 @@ class FeedForwardNetwork(chainer.Chain):
             tags: VariableOrArray,
             labels: VariableOrArray,
             valid_actions: VariableOrArray) -> Variable:
-        h  = F.concat([
+        h = F.concat([
             self.w_embed(words),
             self.t_embed(tags),
             self.l_embed(labels),
         ], 1)
         h = F.relu(self.linear1(h))
-        h = F.dropout(h, ratio=0.5)
+        h = F.dropout(h, 0.5)
         h = self.linear2(h)
         return h * valid_actions
 
 
 class ShiftReduceParser(object):
-    def __init__(self,
-                model: FeedForwardNetwork) -> None:
+    def __init__(self, model: FeedForwardNetwork) -> None:
         self.model = model
 
     def _parse(self,
             sents: List[Sentence],
-            batchsize: int = 1000) -> State:
+            batch_size: int = 1000) -> State:
         res = [None for _ in sents]
         queue = deque((i, State.of_sent(s)) for i, s in enumerate(sents))
         while len(queue) > 0:
-            batch = [queue.pop() for _ in range(min(batchsize, len(queue)))]
+            batch = [queue.pop() for _ in range(min(batch_size, len(queue)))]
             ids, states = zip(*batch)
             with chainer.no_backprop_mode(), \
                     chainer.using_config('train', False):
@@ -658,51 +717,137 @@ class ShiftReduceParser(object):
         return res
 
     def train(self,
+            train_sents: List[Sentence],
+            valid_sents: List[Sentence],
+            action_size: int,
             out_dir: Path,
             init_model: Path,
             epoch: int = 10000,
-            batchsize: int = 10000,
+            batch_size: int = 10000,
             gpu: int = -1,
             val_interval: Tuple[int, str] = (1000, 'iteration'),
             log_interval: Tuple[int, str] = (200, 'iteration'),
             ) -> None:
-
+    
         if init_model:
             log('Load model from %s' % init_model)
             chainer.serializers.load_npz(init_model, self.model)
-
+    
         if gpu >= 0:
             chainer.cuda.get_device(gpu).use()
             self.model.to_gpu()
+    
+        TRAIN = [example for sent in train_sents \
+                            for example in oracle_states(sent, action_size)]
+        log(f'the size of training examples: {len(TRAIN)}')
+        train_iter = chainer.iterators.SerialIterator(TRAIN, batch_size)
 
-        # TRAIN = LSTMParserDataset(args.MODEL, model.extractor, args.TRAIN)
-        train_iter = chainer.iterators.SerialIterator(TRAIN, self.batchsize)
-        # VAL = LSTMParserDataset(args.MODEL, model.extractor, args.VAL)
+        VALID = [example for sent in valid_sents \
+                            for example in oracle_states(sent, action_size)]
+        log(f'the size of validation examples: {len(VALID)}')
         val_iter = chainer.iterators.SerialIterator(
-                    VAL, self.batchsize, repeat=False, shuffle=False)
-
+                    VALID, batch_size, repeat=False, shuffle=False)
+    
         optimizer = chainer.optimizers.AdaGrad(.01, 1e-6)
         optimizer.setup(self.model)
         optimizer.add_hook(WeightDecay(1e-8))
-
+    
         updater = training.updaters.StandardUpdater(
-                # train_iter, optimizer, device=gpu, converter=model.convert)
+            train_iter,
+            optimizer,
+            device = gpu,
+            converter=chainer.dataset.concat_examples)
+        
+        trainer = training.Trainer(
+            updater,
+            (epoch, 'epoch'),
+            out_dir)
 
-        trainer = training.Trainer(updater, (epoch, 'epoch'), out_dir)
-        trainer.extend(extensions.Evaluator(val_iter, self.model,
-                # model.convert, device=gpu), trigger=val_interval)
-        trainer.extend(extensions.snapshot_object(
-                self.model, 'model_iter_{.updater.iteration}'),
-                trigger=val_interval)
-        trainer.extend(extensions.LogReport(trigger=log_interval))
-        trainer.extend(extensions.PrintReport([
+        trainer.extend(
+            extensions.Evaluator(
+                val_iter,
+                self.model,
+                chainer.dataset.concat_examples,
+                device = gpu),
+            trigger = val_interval)
+
+        trainer.extend(
+            extensions.snapshot_object(
+                self.model,
+                'model_iter_{.updater.iteration}'),
+            trigger=val_interval)
+
+        trainer.extend(
+                extensions.PrintReport([
             'epoch', 'iteration',
             'main/accuracy', 'main/loss',
             'validation/main/accuracy',
         ]), trigger=log_interval)
+
+        trainer.extend(extensions.LogReport(trigger=log_interval))
         trainer.extend(extensions.ProgressBar(update_interval=10))
         trainer.run()
-
+    
     def evaluate(self, sents: List[Sentence]) -> None:
         pass
 
+
+def main():
+    parser = argparse.ArgumentParser(description='shift reduce parser')
+    parser.set_defaults(func=lambda _: parser.print_help())
+    subparsers = parser.add_subparsers()
+
+    train = subparsers.add_parser("train")
+    train.add_argument('TRAIN', type = Path)
+    train.add_argument('VALID', type = Path)
+    train.add_argument('PATH', type = Path)
+    train.add_argument('WORD', type = Path)
+    train.add_argument('TAG', type = Path)
+    train.add_argument('LABEL', type = Path)
+    train.add_argument('--pretrained', type = Path)
+    train.add_argument('--embed-units', type = int, default = 50)
+    train.add_argument('--hidden-units', type = int, default = 1024)
+    train.add_argument('--rescale-embeddings', type = bool, default = True)
+    train.add_argument('--init-model', type = Path, default = None)
+    train.add_argument('--epoch', type = int, default = 10000)
+    train.add_argument('--batch-size', type = int, default = 10000)
+    train.add_argument('--gpu', type = int, default = -1)
+
+    loader = DataLoader(args.WORD, args.TAG, args.LABEL, args.pretrained)
+    loader.save(args.PATH / 'loader.pickle')
+
+    train_sents = list(loader.read_conll_train(args.TRAIN))
+    for sent in train_sents:
+        sent.projectivize()
+
+    valid_sents = list(loader.read_conll_test(args.VALID))
+    for sent in valid_sents:
+        sent.projectivize()
+
+    nn = FeedForwardNetwork(
+            len(loader.words),
+            len(loader.tags),
+            len(loader.labels),
+            loader.action_size,
+            args.embed_units,
+            args.hidden_units,
+            args.rescale_embeddings,
+            loader.pretrained
+    )
+    parser = ShiftReduceParser(nn)
+    parser.train(
+            train_sents,
+            valid_sents,
+            loader.action_size,
+            args.PATH,
+            args.init_model,
+            args.epoch,
+            args.batch_size,
+            args.gpu,
+            (1000, 'iteration'),
+            (200, 'iteration'),
+    )
+
+
+if __name__ == '__main__':
+    main()
