@@ -4,6 +4,7 @@ import pickle
 import sys
 import argparse
 import toml
+from tqdm import tqdm
 from pathlib import Path
 from collections import OrderedDict, deque
 from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Iterator, TypeVar
@@ -71,7 +72,8 @@ class Toml(dict):
 
     @staticmethod
     def load(filename: Path) -> 'Toml':
-        return Toml(toml.load(filename))
+        with open(filename) as f:
+            return Toml(toml.load(f))
 
 
 def log(msg):
@@ -93,7 +95,7 @@ def read_vocab(path: Path) -> Dict[str, int]:
     for line in open(path):
         entry = line.strip()
         if entry in res:
-            assert res[entry] == len(res), \
+            assert res[entry] == len(res) - 1, \
                 ('failure in Dataloader.read_vocab: '
                 f'duplicate entry: {entry}.')
         res[entry] = len(res)
@@ -597,7 +599,7 @@ def oracle_states(
         action_size: int) -> List[TrainingExample]:
     def rec(s: State) -> None:
         if s.is_final: return
-        if not s.reducible: 
+        if not s.reducible:
             gold_action = Action.SHIFT
         else:
             s0h = sent[s.top].head
@@ -755,6 +757,9 @@ class ShiftReduceParser(object):
             sents: List[Sentence],
             batch_size: int = 1000) -> State:
         res = [None for _ in sents]
+        pbar = tqdm(
+                total = len(res),
+                desc = 'parsing')
         queue = PriorityQueue(
                 StateWrapper.of_sent(i, s) for i, s in enumerate(sents))
         while len(queue) > 0:
@@ -766,6 +771,7 @@ class ShiftReduceParser(object):
             for wrap, action in zip(batch, preds):
                 state = wrap.state.expand(action)
                 if state.is_final:
+                    pbar.update()
                     res[wrap.id] = state
                 else:
                     queue.push(
@@ -794,13 +800,13 @@ class ShiftReduceParser(object):
             chainer.cuda.get_device(gpu).use()
             self.model.to_gpu()
 
-        TRAIN = [example for sent in train_sents \
-                            for example in oracle_states(sent, action_size)]
+        TRAIN = [example for sent in tqdm(train_sents) \
+                    for example in oracle_states(sent, action_size)]
         log(f'the size of training examples: {len(TRAIN)}')
         train_iter = chainer.iterators.SerialIterator(TRAIN, batch_size)
 
-        VALID = [example for sent in valid_sents \
-                            for example in oracle_states(sent, action_size)]
+        VALID = [example for sent in tqdm(valid_sents) \
+                    for example in oracle_states(sent, action_size)]
         log(f'the size of validation examples: {len(VALID)}')
         val_iter = chainer.iterators.SerialIterator(
                     VALID, batch_size, repeat=False, shuffle=False)
@@ -886,7 +892,7 @@ def main():
     config = Toml.load(args.CONFIG)
 
     loader = DataLoader(**config.loader)
-    loader.save(args.PATH / 'loader.pickle')
+    loader.save(args.OUT / 'loader.pickle')
 
     train_sents = loader.read_conll_train(config.train.train_file)
     for sent in train_sents:
