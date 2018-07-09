@@ -3,9 +3,11 @@ import numpy as np
 import pickle
 import sys
 import argparse
+import toml
 from pathlib import Path
 from collections import OrderedDict, deque
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Iterator
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union, Iterator, TypeVar
+from heapq import heappush, heappop
 
 import chainer
 from chainer import Variable, training
@@ -21,6 +23,14 @@ import chainer.links as L
 Array = np.ndarray
 VariableOrArray = Union[Variable, Array]
 
+T = TypeVar('T')
+
+UNK = 'UNKNOWN'
+PAD = 'PADDING'
+UNK_ID = 0
+PAD_ID = 1
+IGNORE = -1
+
 FeatureSet = NamedTuple(
     'FeatureSet',
     [('words', VariableOrArray),
@@ -28,20 +38,40 @@ FeatureSet = NamedTuple(
     ('labels', VariableOrArray),
 ])
 
-TrainingExample = NamedTuple(
-    'TrainingExample',
-    [('words', VariableOrArray),
-    ('tags', VariableOrArray),
-    ('labels', VariableOrArray),
-    ('valid_actions', VariableOrArray),
-    ('gold_action', VariableOrArray),
+TrainingExample = \
+    Tuple[
+        VariableOrArray,
+        VariableOrArray,
+        VariableOrArray,
+        VariableOrArray,
+        VariableOrArray ]
+
+Token = NamedTuple(
+    'Token',
+    [('form', str),
+    ('lemma', str),
+    ('upos', str),
+    ('xpos', str),
+    ('feats', str),
+    ('head', int),
+    ('deprel', str),
+    ('deps', str),
+    ('misc', str)
 ])
 
-UNK = 'UNKNOWN'
-PAD = 'PADDING'
-UNK_ID = 0
-PAD_ID = 1
-IGNORE = -1
+class Toml(dict):
+    def __init__(self, kwargs):
+        kwargs = {
+            k: Toml(v) if isinstance(v, dict) else v \
+                for k, v in kwargs.items() }
+        super().__init__(**kwargs)
+
+    def __getattr__(self, k):
+        return self.get(k, None)
+
+    @staticmethod
+    def load(filename: Path) -> 'Toml':
+        return Toml(toml.load(filename))
 
 
 def log(msg):
@@ -60,11 +90,12 @@ def normalize(word: str) -> str:
 
 def read_vocab(path: Path) -> Dict[str, int]:
     res = {UNK: UNK_ID}
-    for line in path.open():
+    for line in open(path):
         entry = line.strip()
-        # assert entry not in res, \
-        #     ('failure is Dataloader.read_vocab: '
-        #     f'duplicate entry: {entry}.')
+        if entry in res:
+            assert res[entry] == len(res), \
+                ('failure in Dataloader.read_vocab: '
+                f'duplicate entry: {entry}.')
         res[entry] = len(res)
     return res
 
@@ -85,25 +116,14 @@ def read_pretrained(path: Path) -> Array:
     return res
 
 
-
 class Sentence(object):
     def __init__(self,
-            words:  List[str],
-            lemmas: List[str],
-            tags1:  List[str],
-            tags2:  List[str],
-            labels: List[str],
-            heads:  List[int],
-            word_ids:  Array,
-            tag_ids:   Array,
+            tokens: List[Token],
+            word_ids: Array,
+            tag_ids: Array,
             label_ids: Array,
             root_node = True) -> None:
-        self.words = words
-        self.lemmas = lemmas
-        self.tags1 = tags1
-        self.tags2 = tags2
-        self.labels = labels
-        self.heads = heads
+        self.tokens = tokens
         self.word_ids = word_ids
         self.tag_ids = tag_ids
         self.label_ids = label_ids
@@ -117,31 +137,23 @@ class Sentence(object):
         """
             return string in CoNLL format.
         """
-        res = ''
-        for i in range(self.start, len(self)):
-            items = [
-                str(i),
-                self.words[i],
-                self.lemmas[i],
-                self.tags1[i],
-                self.tags2[i],
-                '-',
-                str(self.heads[i]),
-                self.labels[i],
-                '-', 
-                '-' ]
-            res += '\t'.join(items) + '\n'
-        return res
+        return ''.join(
+                '%d\t%s\n' % (i, '\t'.join(map(str, token))) \
+                    for i, token in enumerate(self.tokens[self.start:], 1)
+                )
 
     def __len__(self) -> int:
-        return len(self.words)
+        return len(self.tokens)
+
+    def __getitem__(self, i: int) -> Token:
+        return self.tokens[i]
 
     def visualize(self) -> str:
         token_str = ['root']
         children: List[List[int]] = [[] for _ in range(len(self))]
-        for i in range(self.start, len(self)):
-            token_str.append(f'{self.words[i]} @{i}')
-            children[self.heads[i]].append(i)
+        for i, token in enumerate(self.tokens[self.start:], 1):
+            token_str.append(f'{token.form} @{i}')
+            children[token.head].append(i)
 
         def to_dict(i: int) -> OrderedDict:
             d: OrderedDict = OrderedDict()
@@ -167,9 +179,9 @@ class Sentence(object):
             left  = [-1] * ntokens
             right = [ntokens] * ntokens
 
-            for i, head in enumerate(self.heads):
-                l = min(i, head)
-                r = max(i, head)
+            for i, token in enumerate(self.tokens):
+                l = min(i, token.head)
+                r = max(i, token.head)
 
                 for j in range(l+1, r):
                     if left[j] < l: left[j] = l
@@ -177,10 +189,10 @@ class Sentence(object):
 
             deepest_arc = -1
             max_depth = 0
-            for i, head in enumerate(self.heads):
-                if head == 0: continue
-                l = min(i, head)
-                r = max(i, head)
+            for i, token in enumerate(self.tokens):
+                if token.head == 0: continue
+                l = min(i, token.head)
+                r = max(i, token.head)
                 lbound = max(left[l], left[r])
                 rbound = min(right[l], right[r])
 
@@ -189,27 +201,27 @@ class Sentence(object):
                     j = i
                     while j != 0:
                         depth += 1
-                        j = self.heads[j]
+                        j = self[j].head
                     if depth > max_depth:
                         deepest_arc = i
                         max_depth = depth
 
             if deepest_arc == -1: return
-            lifted_head = self.heads[self.heads[deepest_arc]]
-            self.heads[deepest_arc] = lifted_head
-
+            lifted_head = self[self[deepest_arc].head].head
+            self.tokens[deepest_arc] = \
+                    self[deepest_arc]._replace(head = lifted_head)
 
 class DataLoader(object):
     def __init__(self,
-                word_path: Path,
-                tag_path: Path,
-                label_path: Path,
-                pretrained_path: Optional[Path] = None) -> None:
-        self.words = read_vocab(word_path)
-        self.tags = read_vocab(tag_path)
-        self.labels = read_vocab(label_path)
-        self.pretrained = read_pretrained(pretrained_path) \
-                if pretrained_path is not None else None
+                word_file: Path,
+                tag_file: Path,
+                label_file: Path,
+                pretrained: Optional[Path] = None) -> None:
+        self.words = read_vocab(word_file)
+        self.tags = read_vocab(tag_file)
+        self.labels = read_vocab(label_file)
+        self.pretrained = read_pretrained(pretrained) \
+                if pretrained is not None else None
 
     def _get_or_add_entry(
             self, entry: str, accept_new_entry: bool) -> int:
@@ -238,54 +250,50 @@ class DataLoader(object):
     def read_conll(
                 self,
                 filename: Path,
-                accept_new_entry: bool = True) -> Iterator[Sentence]:
+                accept_new_entry: bool = True) -> List[Sentence]:
         """
         reads .conll file and returns a list of Sentence
         """
-        def new_kwargs() -> Dict[str, List]:
-            return dict(
-            words = [PAD],
-            lemmas = [PAD],
-            tags1 = [UNK],
-            tags2 = [UNK],
-            labels = [UNK],
-            heads = [0],
-            word_ids = [PAD_ID],
-            tag_ids = [UNK_ID],
-            label_ids = [UNK_ID],
-        )
-        kwargs = new_kwargs()
-        for line in filename.open():
+
+        root_token = Token(PAD, PAD, UNK, UNK, UNK, 0, UNK, UNK, UNK)
+
+        def make_matrices(tokens: List[Token]
+                ) -> Tuple[Array, Array, Array]:
+            word_ids = np.array( \
+                [self._get_or_add_entry( \
+                    token.form, accept_new_entry) \
+                        for token in tokens], int)
+            tag_ids = np.array(
+                [self.tags[token.upos] for token in tokens], int)
+            label_ids = np.array(
+                [self.labels[token.deprel] for token in tokens], int)
+            return word_ids, tag_ids, label_ids
+
+        res = []
+        tokens = [root_token]
+        for line in open(filename):
             line = line.strip()
             if line == '':
-                kwargs['word_ids'] = np.asarray(kwargs['word_ids'], int)
-                kwargs['tag_ids'] = np.asarray(kwargs['tag_ids'], int)
-                kwargs['label_ids'] = np.asarray(kwargs['label_ids'], int)
-                yield Sentence(**kwargs)
-                kwargs = new_kwargs()
-                continue
-            items = line.split('\t')
-            kwargs['words'].append(items[1])
-            kwargs['lemmas'].append(items[2])
-            kwargs['tags1'].append(items[3])
-            kwargs['tags2'].append(items[4])
-            kwargs['labels'].append(items[7])
-            kwargs['heads'].append(int(items[6]))
-            kwargs['word_ids'].append(
-                    self._get_or_add_entry(items[1], accept_new_entry))
-            kwargs['tag_ids'].append(self.tags[items[3]])
-            kwargs['label_ids'].append(self.labels[items[7]])
+                res.append(
+                    Sentence(tokens,
+                        *make_matrices(tokens))
+                    )
+                tokens = [root_token]
+            else:
+                items = line.split('\t')
+                items[6] = int(items[6]) # type: ignore
+                tokens.append(Token._make(items[1:]))
+        return res
 
     def read_conll_test(self, filename: Path) -> List[Sentence]:
-        sents = list(self.read_conll(filename, False))
-        return sents
+        return self.read_conll(filename, False)
 
     def read_conll_train(self, filename: Path) -> List[Sentence]:
         """
             load CoNLL sentences, update vocabulary (`DataLoader.words`)
             and add entries for new words to the pretrained embedding matrix.
         """
-        sents = list(self.read_conll(filename, True))
+        sents = self.read_conll(filename, True)
         if self.pretrained is not None:
             log('adding entries for new words to the pretrained embeddings')
             old_vocab_size, units = self.pretrained.shape
@@ -297,14 +305,13 @@ class DataLoader(object):
         return sents
 
     def save(self, filename: Path) -> None:
-        with filename.open('wb') as f:
+        with open(filename, 'wb') as f:
             pickle.dump(self, f)
 
     @staticmethod
     def load(filename: Path) -> 'DataLoader':
-        with filename.open() as f:
+        with open(filename) as f:
             return pickle.load(f)
-
 
 
 ########################################################################
@@ -524,23 +531,24 @@ class State(object):
         def rec(s: State, stack: List[str]) -> List[str]:
             if not s.is_dummy:
                 stack = rec(s.left, stack)
-                stack.append(
-                    f'{self.sent.words[self.top]}/{self.sent.tags1[self.top]}')
+                token = self.sent[self.top]
+                stack.append(f'{token.form}/{token.upos}')
             return stack
         stack = rec(self, [])
-        buff = [f'{word}/{tag1}' for word, tag1 in \
-                    zip(self.sent.words[self.right:],
-                        self.sent.tags1[self.right:]) ]
+        buff = [f'{token.form}/{token.upos}' \
+                    for token in self.sent[self.right:]]
         return f'[{" ".join(stack)}] [{" ".join(buff)}]'
 
-    def feature_set(self) -> FeatureSet:
-        def idx_or_zero(idx: int) -> int:
-            return idx if idx < len(self.sent) else 0
+    def buffer(self, nth: int) -> int:
+        idx = self.right + nth
+        return idx if idx < len(self.sent) else 0
 
-        idx = [idx_or_zero(self.right),                  # b0
-              idx_or_zero(self.right + 1),               # b1
-              idx_or_zero(self.right + 2),               # b2
-              idx_or_zero(self.right + 3),               # b3
+    def feature_set(self) -> FeatureSet:
+
+        idx = [self.buffer(0),                           # b0
+              self.buffer(1),                            # b1
+              self.buffer(2),                            # b2
+              self.buffer(3),                            # b3
               self.top,                                  # s0
               self.lchild1.state.top,                    # s0l
               self.lchild2.state.top,                    # s0l2
@@ -578,6 +586,11 @@ class State(object):
         tags = self.sent.tag_ids[idx]
         return FeatureSet(words, tags, labels)
 
+    def valid_actions(self, action_size: int):
+        return np.array([self.is_valid(action) \
+                    for action in range(action_size)]
+                ).astype(float)
+
 
 def oracle_states(
         sent: Sentence,
@@ -587,19 +600,18 @@ def oracle_states(
         if not s.reducible: 
             gold_action = Action.SHIFT
         else:
-            s0h = sent.heads[s.top]
-            s1h = sent.heads[s.left.top]
+            s0h = sent[s.top].head
+            s1h = sent[s.left.top].head
             if s1h == s.top:
                 label = sent.label_ids[s.left.top]
                 gold_action = Action.reducel(label)
             elif s0h == s.left.top and \
-                all(h != s.top for h in sent.heads[s.right:]):
+                all(token.head != s.top for token in sent[s.right:]):
                 label = sent.label_ids[s.top]
                 gold_action = Action.reducer(label)
             else:
                 gold_action = Action.SHIFT
-        valid_actions = np.array( [s.is_valid(action) \
-                for action in range(action_size)] ).astype(float)
+        valid_actions = s.valid_actions(action_size)
         gold_action = np.array(gold_action, int)
         words, tags, labels = s.feature_set()
         res.append(
@@ -693,6 +705,47 @@ class FeedForwardNetwork(chainer.Chain):
         h = self.linear2(h)
         return h * valid_actions
 
+    def predict(self, states: List[State]) -> Array:
+        features = [s.feature_set() + \
+                    (s.valid_actions(self.action_size),) for s in states]
+        batch = chainer.dataset.concat_examples(features)
+        logits = self.forward(*batch).data
+        res = np.argmax(logits, axis=1)
+        return res
+
+
+class PriorityQueue(object):
+    def __init__(self, init: Iterator[T]) -> None:
+        self.queue = list(init)
+
+    def push(self, value: T) -> None:
+        heappush(self.queue, value)
+
+    def pop(self) -> T:
+        return heappop(self.queue)
+
+    def __len__(self) -> int:
+        return len(self.queue)
+
+    def __contains__(self, item: T) -> bool:
+        return item in self.queue
+
+
+class StateWrapper(
+    NamedTuple('StateWrapper',
+        [('priority', int),
+        ('id', int),
+        ('state', State)])):
+
+    def __le__(self, other: 'StateWrapper') -> bool:
+        return self.priority >= other.priority
+
+    @staticmethod
+    def of_sent(i: int, sent: Sentence) -> 'StateWrapper':
+        return StateWrapper(
+            priority = len(sent),
+            id = i,
+            state = State.of_sent(sent))
 
 class ShiftReduceParser(object):
     def __init__(self, model: FeedForwardNetwork) -> None:
@@ -702,19 +755,21 @@ class ShiftReduceParser(object):
             sents: List[Sentence],
             batch_size: int = 1000) -> State:
         res = [None for _ in sents]
-        queue = deque((i, State.of_sent(s)) for i, s in enumerate(sents))
+        queue = PriorityQueue(
+                StateWrapper.of_sent(i, s) for i, s in enumerate(sents))
         while len(queue) > 0:
             batch = [queue.pop() for _ in range(min(batch_size, len(queue)))]
-            ids, states = zip(*batch)
+            _, _, states = zip(*batch)
             with chainer.no_backprop_mode(), \
                     chainer.using_config('train', False):
                 preds = self.model.predict(states)
-            for i, state, action in zip(ids, states, preds):
-                state = state.expand(action)
-                if state.isfinal:
-                    res[i] = state
+            for wrap, action in zip(batch, preds):
+                state = wrap.state.expand(action)
+                if state.is_final:
+                    res[wrap.id] = state
                 else:
-                    queue.append((i, state))
+                    queue.push(
+                        wrap._replace(state = state))
         assert (s is not None for s in res)
         return res
 
@@ -723,7 +778,7 @@ class ShiftReduceParser(object):
             valid_sents: List[Sentence],
             action_size: int,
             out_dir: Path,
-            init_model: Path,
+            init_model: Optional[Path],
             epoch: int = 10000,
             batch_size: int = 10000,
             gpu: int = -1,
@@ -731,7 +786,7 @@ class ShiftReduceParser(object):
             log_interval: Tuple[int, str] = (200, 'iteration'),
             ) -> None:
 
-        if init_model:
+        if init_model is not None:
             log('Load model from %s' % init_model)
             chainer.serializers.load_npz(init_model, self.model)
 
@@ -790,8 +845,32 @@ class ShiftReduceParser(object):
         trainer.extend(extensions.ProgressBar(update_interval=10))
         trainer.run()
 
-    def evaluate(self, sents: List[Sentence]) -> None:
-        pass
+    def evaluate(self, sents: List[Sentence], verbose = True) -> None:
+        states = self._parse(sents)
+        ignore = ["''", ",", ".", ":", "``"]
+        unlabeled, labeled, total = 0, 0, 0
+        for state in states:
+            sent = state.sent
+            predheads  = state.to_heads()
+            predlabels = state.to_labels()
+            goldheads  = [token.head for token in sent.tokens]
+            goldlabels = sent.label_ids
+            for i, token in enumerate(sent.tokens):
+                if i == 0 or token.form in ignore: continue # skip root
+                total += 1
+                if predheads[i] == goldheads[i]:
+                    unlabeled += 1
+                    if predlabels[i] == goldlabels[i]:
+                        labeled += 1
+        uas = float(unlabeled) / float(total)
+        las = float(labeled) / float(total)
+        if verbose:
+           log(f'UAS:{uas:0.4f}\tLAS:{las:0.4f}')
+
+
+########################################################################
+############################## Main Function ###########################
+########################################################################
 
 
 def main():
@@ -800,55 +879,45 @@ def main():
     subparsers = parser.add_subparsers()
 
     train = subparsers.add_parser("train")
-    train.add_argument('TRAIN', type = Path)
-    train.add_argument('VALID', type = Path)
-    train.add_argument('PATH', type = Path)
-    train.add_argument('WORD', type = Path)
-    train.add_argument('TAG', type = Path)
-    train.add_argument('LABEL', type = Path)
-    train.add_argument('--pretrained', type = Path)
-    train.add_argument('--embed-units', type = int, default = 50)
-    train.add_argument('--hidden-units', type = int, default = 1024)
-    train.add_argument('--rescale-embeddings', type = bool, default = True)
-    train.add_argument('--init-model', type = Path, default = None)
-    train.add_argument('--epoch', type = int, default = 10000)
-    train.add_argument('--batch-size', type = int, default = 10000)
+    train.add_argument('CONFIG', type = Path)
+    train.add_argument('OUT', type = Path)
     train.add_argument('--gpu', type = int, default = -1)
     args = parser.parse_args()
+    config = Toml.load(args.CONFIG)
 
-    loader = DataLoader(args.WORD, args.TAG, args.LABEL, args.pretrained)
+    loader = DataLoader(**config.loader)
     loader.save(args.PATH / 'loader.pickle')
 
-    train_sents = loader.read_conll_train(args.TRAIN)
+    train_sents = loader.read_conll_train(config.train.train_file)
     for sent in train_sents:
         sent.projectivize()
 
-    valid_sents = loader.read_conll_test(args.VALID)
+    valid_sents = loader.read_conll_test(config.train.valid_file)
     for sent in valid_sents:
         sent.projectivize()
 
     nn = FeedForwardNetwork(
-            len(loader.words),
-            len(loader.tags),
-            len(loader.labels),
-            loader.action_size,
-            args.embed_units,
-            args.hidden_units,
-            args.rescale_embeddings,
-            loader.pretrained
+        len(loader.words),
+        len(loader.tags),
+        len(loader.labels),
+        loader.action_size,
+        config.nn.embed_units,
+        config.nn.hidden_units,
+        config.nn.rescale_embeddings,
+        loader.pretrained
     )
     parser = ShiftReduceParser(nn)
     parser.train(
-            train_sents,
-            valid_sents,
-            loader.action_size,
-            args.PATH,
-            args.init_model,
-            args.epoch,
-            args.batch_size,
-            args.gpu,
-            (2000, 'iteration'),
-            (400, 'iteration'),
+        train_sents,
+        valid_sents,
+        loader.action_size,
+        args.OUT,
+        config.train.init_model,
+        config.train.epoch,
+        config.train.batch_size,
+        args.gpu,
+        (2000, 'iteration'),
+        (400, 'iteration'),
     )
 
 
